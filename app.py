@@ -6,17 +6,24 @@ from collections import Counter
 from dotenv import load_dotenv
 load_dotenv()
 
+# ---- FTP / SFTP ----
 import ftplib
 try:
     import paramiko
 except ImportError:
     paramiko = None
 
+# ---- Data handling ----
 import pandas as pd
 from lxml import etree
 
+# ---- Google Sheets ----
 import gspread
 from google.oauth2.service_account import Credentials
+
+# ---- Postgres ----
+import psycopg2
+from psycopg2.extras import execute_values
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -73,7 +80,7 @@ def _append_df(ws, df: pd.DataFrame):
         ws.append_rows(data[i:i+CHUNK], value_input_option="RAW")
     logger.info("Appended %d new rows.", len(data))
 
-# ---------------- FTP / SFTP ----------------
+# ---------------- FTP/SFTP ----------------
 def _ftp_connect(host: str, port: int, user: str, password: str) -> ftplib.FTP:
     ftp = ftplib.FTP()
     ftp.connect(host, port, timeout=60)
@@ -121,33 +128,20 @@ COMMON_RECORD_TAGS = {"Order","ORDER","order","Record","RECORD","record","Row","
 FIELD_LIKE_TOKENS = {"web_order_number","order","id","date","track","awb","consign","amount","total","price","shipping","carrier","service","method","tracking"}
 
 def _flatten_elem(elem: etree._Element, prefix: str = "", out: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """
-    Recursively flatten an element:
-    - Text at any depth -> key like 'parent.child'
-    - Attributes -> key like 'tag@attr'
-    """
     if out is None:
         out = {}
     if not isinstance(elem.tag, str):
         return out
-
     name = elem.tag
     key_prefix = f"{prefix}.{name}" if prefix else name
-
-    # element text
     text = (elem.text or "").strip()
     if text:
         out[key_prefix] = text
-
-    # attributes
     for attr, val in (elem.attrib or {}).items():
         if val:
             out[f"{key_prefix}@{attr}"] = str(val).strip()
-
-    # recurse
     for ch in elem:
         _flatten_elem(ch, key_prefix, out)
-
     return out
 
 def _score_parent_for_order_fields(elem: etree._Element) -> int:
@@ -173,19 +167,16 @@ def _detect_record_tag(root: etree._Element, hint: Optional[str]) -> Tuple[Optio
         matches = root.findall(f".//{hint}")
         if matches:
             return hint, None
-
     container = _detect_container(root)
     if container is not None:
         child_counter = Counter()
         for ch in container:
             if isinstance(ch.tag, str) and ch.tag.lower() not in NOISE_TAGS:
                 child_counter[ch.tag] += 1
-
         if child_counter:
             for name in COMMON_RECORD_TAGS:
                 if child_counter.get(name, 0) > 1:
                     return name, None
-            # if looks field-like → one order per file
             fieldish = sum(1 for t in child_counter if any(tok in t.lower() for tok in FIELD_LIKE_TOKENS))
             if fieldish >= 1:
                 return None, container
@@ -194,8 +185,6 @@ def _detect_record_tag(root: etree._Element, hint: Optional[str]) -> Tuple[Optio
                 return most_tag, None
             else:
                 return None, container
-
-    # fallbacks
     tag_counts = Counter()
     for elem in root.iter():
         if not isinstance(elem.tag, str):
@@ -207,7 +196,6 @@ def _detect_record_tag(root: etree._Element, hint: Optional[str]) -> Tuple[Optio
     for pref in COMMON_RECORD_TAGS:
         if tag_counts.get(pref, 0) > 1:
             return pref, None
-
     best = None
     best_score = 0
     for elem in root.iter():
@@ -223,13 +211,10 @@ def _detect_record_tag(root: etree._Element, hint: Optional[str]) -> Tuple[Optio
             best = elem
     if best is not None:
         return None, best
-
     return None, None
 
 def _map_row(flat: Dict[str, str]) -> Dict[str, str]:
-    # Normalize keys to lower for searching
     items = {k.lower(): v for k, v in flat.items()}
-
     def get_first(exacts: List[str], contains: List[str]) -> Optional[str]:
         for k in exacts:
             if k in items and items[k]:
@@ -239,75 +224,49 @@ def _map_row(flat: Dict[str, str]) -> Dict[str, str]:
                 if needle in k and v:
                     return v
         return None
-
-    # Order ID
     order_id = get_first(
         ["web_order_number","order_id","orderid","order_number","order-no","id"],
         ["web_order","order","ref","number"]
     )
-
-    # Amount (much broader)
     amount = get_first(
         ["amount","order_amount","orderamount","total","order_total","ordertotal","grand_total","grandtotal",
          "subtotal","price","unit_price","unitprice","amount@value","total@value","price@value"],
         ["amount","total","price","sum","subtotal","amt"]
     )
-
-    # Date
     date = get_first(
         ["date","order_date","orderdate","created","create_date","datetime","timestamp"],
         ["date","created","time"]
     )
-
-    # Tracking
     tracking = get_first(
         ["tracking_number","tracking","awb","consignment","consign","tn"],
         ["track","awb","consign","tracking"]
     )
-
-    # Method
     method = get_first(
         ["shipping_method","ship_method","shipping","service","carrier","method","ship_via","shipvia"],
         ["shipping","service","carrier","method"]
     )
-
-    # Heuristics for amount text patterns
     def find_money_candidate() -> Optional[str]:
         for k, v in items.items():
-            if not v:
-                continue
-            s = v.strip().replace(",", "")
-            # allow $ or leading currency codes
-            s = s.replace("$", "")
-            # match 1-4 digits with optional .2 decimals (5, 5.75, 1234, 29.22)
+            if not v: continue
+            s = v.strip().replace(",", "").replace("$", "")
             if re.fullmatch(r"[A-Za-z]{0,3}\s*\d{1,4}(\.\d{1,2})?", v.strip()) or re.fullmatch(r"\d{1,4}(\.\d{1,2})?", s):
-                # skip clear non-amounts (tracking: 12+ digits)
                 digits = "".join(ch for ch in s if ch.isdigit())
                 if 1 <= len(digits) <= 8:
                     return v.strip()
         return None
-
-    # Swap fixes Amount ↔ Method
     def is_money_like(x: str) -> bool:
-        if not x:
-            return False
+        if not x: return False
         s = x.strip().replace(",", "").replace("$", "")
         return re.fullmatch(r"\d{1,4}(\.\d{1,2})?", s) is not None
-
     carriers = ("usps","ups","fedex","dhl","ground","express","priority","advantage","smartpost","home delivery")
-
     if (not amount or not is_money_like(amount)) and method and is_money_like(method):
         amount, method = method, ""
-
     if amount and not is_money_like(amount) and not method and any(w in amount.lower() for w in carriers):
         method, amount = amount, ""
-
     if not amount:
         amount = find_money_candidate()
-
     if not amount:
-        logger.debug("Amount still missing; record keys: %s", ", ".join(sorted(items.keys())))
-
+        logger.debug("Amount missing; record keys: %s", ", ".join(sorted(items.keys())))
     return {
         "Order ID":        (order_id or "").strip(),
         "Amount":          (amount or "").strip(),
@@ -321,21 +280,16 @@ def _xml_records_to_df(xml_bytes: bytes, record_tag_hint: Optional[str]) -> pd.D
         root = etree.fromstring(xml_bytes)
     except Exception as e:
         raise RuntimeError(f"Invalid XML: {e}")
-
     record_tag, container_elem = _detect_record_tag(root, record_tag_hint)
-
     rows: List[Dict[str, str]] = []
     if container_elem is not None and record_tag is None:
         flat = _flatten_elem(container_elem)
-        mapped = _map_row(flat)
-        rows.append(mapped)
+        rows.append(_map_row(flat))
     else:
         elems = root.findall(f".//{record_tag}") if record_tag else []
         for rec in elems:
             flat = _flatten_elem(rec)
-            mapped = _map_row(flat)
-            rows.append(mapped)
-
+            rows.append(_map_row(flat))
     df = pd.DataFrame(rows, dtype=str)
     if not df.empty:
         for c in df.columns:
@@ -350,6 +304,37 @@ def _normalize_orders_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.reindex(columns=TARGET_ORDER, fill_value="")
     out = out.drop_duplicates(subset=["Order ID"])
     return out
+
+# ---------------- DB save ----------------
+def save_orders_to_db(df: pd.DataFrame):
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        logger.info("DATABASE_URL not set, skipping DB insert.")
+        return
+    if df.empty:
+        logger.info("No new orders to save to DB.")
+        return
+    conn = psycopg2.connect(db_url)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id TEXT PRIMARY KEY,
+            amount TEXT,
+            date TEXT,
+            tracking_number TEXT,
+            shipping_method TEXT
+        )
+    """)
+    rows = df.values.tolist()
+    execute_values(cur,
+        "INSERT INTO orders (order_id, amount, date, tracking_number, shipping_method) VALUES %s "
+        "ON CONFLICT (order_id) DO NOTHING",
+        rows
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    logger.info("Saved %d orders into database.", len(rows))
 
 # ---------------- Main ----------------
 def main():
@@ -366,7 +351,7 @@ def main():
     record_tag_hint = (os.getenv("XML_RECORD_TAG") or "").strip() or None
 
     if not all([host, user, password, spreadsheet_id]):
-        missing = [k for k, v in [
+        missing = [k for k,v in [
             ("FTP_HOST", host), ("FTP_USER", user), ("FTP_PASSWORD", password),
             ("GOOGLE_SHEETS_SPREADSHEET_ID", spreadsheet_id),
         ] if not v]
@@ -447,6 +432,7 @@ def main():
         logger.info("No new orders to append. All Order IDs already present.")
     else:
         _append_df(ws, new_df)
+        save_orders_to_db(new_df)
     logger.info("Done. %d new orders appended.", 0 if new_df.empty else len(new_df))
 
 if __name__ == "__main__":

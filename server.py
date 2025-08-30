@@ -4,10 +4,9 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
-# import your importer main()
+# import your importer
 import app as importer
 
-# Secret token for authorization
 RUN_TOKEN = os.getenv("RUN_TOKEN", "")
 
 app = FastAPI(title="Eldorado Import Trigger")
@@ -32,7 +31,7 @@ def health():
     return {"ok": True}
 
 @app.post("/run", response_model=RunResponse)
-@app.get("/run", response_model=RunResponse)   # allow GET with ?token=
+@app.get("/run", response_model=RunResponse)  # allow GET with ?token=
 def run(request: Request):
     token = request.headers.get("X-Run-Token") or request.query_params.get("token")
     if not RUN_TOKEN or token != RUN_TOKEN:
