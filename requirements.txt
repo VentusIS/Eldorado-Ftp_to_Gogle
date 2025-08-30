@@ -1,0 +1,6 @@
+gspread==6.0.0
+google-auth==2.35.0
+pandas==2.2.2
+lxml==5.2.2
+paramiko==3.4.0
+python-dotenv==1.0.1
